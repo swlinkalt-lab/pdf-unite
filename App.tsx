@@ -12,6 +12,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import { PDFDocument } from 'pdf-lib';
+import { Buffer } from 'buffer';
 
 type PdfItem = {
   id: string;
@@ -22,6 +23,38 @@ type PdfItem = {
 
 /** ===== 設定値 ===== */
 const MAX_TOTAL_PAGES = 150;
+
+/** ===== Base64変換（Android対応）===== */
+const base64ToUint8Array = (base64: string) =>
+  Uint8Array.from(Buffer.from(base64, 'base64'));
+
+const uint8ArrayToBase64 = (bytes: Uint8Array) =>
+  Buffer.from(bytes).toString('base64');
+
+/** ===== Android content URI を cache にコピー ===== */
+const normalizePdfUri = async (uri: string) => {
+  if (Platform.OS !== 'android') return uri;
+
+  // content:// のみ対象
+  if (!uri.startsWith('content://')) return uri;
+
+  const fs: any = FileSystem;
+  const cacheDir = fs.cacheDirectory;
+
+  if (!cacheDir) {
+    throw new Error('cacheDirectory が取得できません');
+  }
+
+  const fileName = `tmp_${Date.now()}.pdf`;
+  const dest = cacheDir + fileName;
+
+  await FileSystem.copyAsync({
+    from: uri,
+    to: dest,
+  });
+
+  return dest;
+};
 
 export default function App() {
   const [data, setData] = useState<PdfItem[]>([]);
@@ -55,28 +88,31 @@ export default function App() {
       for (let i = 0; i < result.assets.length; i++) {
         const file = result.assets[i];
 
-        const base64 = await FileSystem.readAsStringAsync(file.uri, {
+        // ★ ここが今回の肝
+        const safeUri = await normalizePdfUri(file.uri);
+
+        const base64 = await FileSystem.readAsStringAsync(safeUri, {
           encoding: 'base64' as any,
         });
 
-        const bytes = Uint8Array.from(atob(base64), c =>
-          c.charCodeAt(0)
-        );
-
+        const bytes = base64ToUint8Array(base64);
         const pdf = await PDFDocument.load(bytes);
 
         items.push({
           id: `${Date.now()}-${i}`,
           name: file.name ?? 'unknown.pdf',
-          uri: file.uri,
+          uri: safeUri, // ★ 正規化後URIを保持
           pages: pdf.getPageCount(),
         });
       }
 
       setData(prev => [...prev, ...items]);
-    } catch (e) {
-      Alert.alert('エラー', 'PDFの読み込みに失敗しました');
-      console.error(e);
+    } catch (e: any) {
+      console.error('PDF読み込みエラー:', e);
+      Alert.alert(
+        'PDFの読み込みに失敗しました',
+        e?.message ?? String(e)
+      );
     }
   };
 
@@ -101,41 +137,44 @@ export default function App() {
 
   /** PDF結合処理（保存してURI返却） */
   const buildMergedPdf = async (finalName: string) => {
-    const mergedPdf = await PDFDocument.create();
+    try {
+      const mergedPdf = await PDFDocument.create();
 
-    for (const item of data) {
-      const base64 = await FileSystem.readAsStringAsync(item.uri, {
+      for (const item of data) {
+        const base64 = await FileSystem.readAsStringAsync(item.uri, {
+          encoding: 'base64' as any,
+        });
+
+        const bytes = base64ToUint8Array(base64);
+        const pdf = await PDFDocument.load(bytes);
+
+        const pages = await mergedPdf.copyPages(
+          pdf,
+          pdf.getPageIndices()
+        );
+        pages.forEach(p => mergedPdf.addPage(p));
+      }
+
+      const mergedBytes = await mergedPdf.save();
+      const mergedBase64 = uint8ArrayToBase64(mergedBytes);
+
+      const fs: any = FileSystem;
+      const dir =
+        fs.cacheDirectory ?? fs.documentDirectory;
+
+      if (!dir) throw new Error('保存先ディレクトリが取得できません');
+
+      const uri = dir + finalName;
+
+      await FileSystem.writeAsStringAsync(uri, mergedBase64, {
         encoding: 'base64' as any,
       });
 
-      const bytes = Uint8Array.from(atob(base64), c =>
-        c.charCodeAt(0)
-      );
-
-      const pdf = await PDFDocument.load(bytes);
-      const pages = await mergedPdf.copyPages(
-        pdf,
-        pdf.getPageIndices()
-      );
-      pages.forEach(p => mergedPdf.addPage(p));
+      return uri;
+    } catch (e) {
+      console.error('PDF結合エラー:', e);
+      throw e;
     }
-
-    const mergedBytes = await mergedPdf.save();
-    const mergedBase64 = btoa(
-      String.fromCharCode(...mergedBytes)
-    );
-
-    const dir =
-      (FileSystem as any).cacheDirectory ??
-      (FileSystem as any).documentDirectory;
-
-    const uri = dir + finalName;
-
-    await FileSystem.writeAsStringAsync(uri, mergedBase64, {
-      encoding: 'base64' as any,
-    });
-
-    return uri;
   };
 
   /** 結合ボタン押下 */
@@ -148,7 +187,7 @@ export default function App() {
     if (totalPages > MAX_TOTAL_PAGES) {
       Alert.alert(
         'ページ数上限を超えています',
-        `合計 ${totalPages} ページです。\n\n本アプリでは ${MAX_TOTAL_PAGES} ページまで結合できます。\nPDFを減らして再度お試しください。`
+        `合計 ${totalPages} ページです。\n\n本アプリでは ${MAX_TOTAL_PAGES} ページまで結合できます。`
       );
       return;
     }
@@ -170,8 +209,11 @@ export default function App() {
               setMerging(true);
               await buildMergedPdf(finalName);
               Alert.alert('完了', 'ファイルを保存しました');
-            } catch {
-              Alert.alert('エラー', '保存に失敗しました');
+            } catch (e: any) {
+              Alert.alert(
+                '保存に失敗しました',
+                e?.message ?? String(e)
+              );
             } finally {
               setMerging(false);
             }
@@ -189,8 +231,11 @@ export default function App() {
               } else {
                 Alert.alert('Webでは共有できません');
               }
-            } catch {
-              Alert.alert('エラー', '共有に失敗しました');
+            } catch (e: any) {
+              Alert.alert(
+                '共有に失敗しました',
+                e?.message ?? String(e)
+              );
             } finally {
               setMerging(false);
             }
